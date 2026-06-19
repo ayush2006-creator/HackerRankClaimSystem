@@ -1,10 +1,10 @@
 # Evaluation Report
 
 ## Accuracy Metrics (Sample Set)
-- **evidence_standard_met**: 12/20 (60.0%)
-- **claim_status**: 12/20 (60.0%)
-- **issue_type**: 9/20 (45.0%)
-- **object_part**: 10/20 (50.0%)
+- **evidence_standard_met**: 16/20 (80.0%)
+- **claim_status**: 10/20 (50.0%)
+- **issue_type**: 12/20 (60.0%)
+- **object_part**: 17/20 (85.0%)
 
 ## Operational Analysis
 - **Stage A (Object Verification)**: Local CLIP inference. Cost: Free. Call count: 1 per image.

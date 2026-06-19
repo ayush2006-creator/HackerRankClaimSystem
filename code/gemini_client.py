@@ -1,157 +1,115 @@
 """
 gemini_client.py
-Shared, rate-limited, retry-enabled Gemini client used by all modules
-that call the Gemini API (object_classifier, laptop_damage, package_damage,
-transcript_matcher).
-
-Handles:
-  - Global rate limiting (respects free-tier 5 RPM for gemini-2.5-flash)
-  - Automatic retry with exponential backoff for 429 and 503 errors
-  - Shared singleton client (one Client instance, one set of credentials)
+Shared client routed to Amazon Bedrock running Meta Llama 3.2 Vision.
 """
 
 import os
+import io
 import re
-import time
 import logging
-import threading
-from typing import Optional
+from typing import Optional, Any
+import boto3
 
-from google import genai
-from google.genai import types
+# Bedrock Model configuration
+# Defaults to Amazon Nova Pro (v1), which is an active, fully supported vision model.
+# Can be overridden via BEDROCK_MODEL_ID in .env
+BEDROCK_MODEL_ID = os.environ.get("BEDROCK_MODEL_ID", "amazon.nova-pro-v1:0")
+AWS_REGION = os.environ.get("AWS_DEFAULT_REGION", "us-east-1")
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-GEMINI_MODEL = "gemini-2.5-flash"
+logger = logging.getLogger("bedrock_client")
 
-# Model rotation: each model has its own 20 RPD free-tier quota.
-# Rotating between them effectively doubles our daily limit to 40 RPD.
-_MODEL_POOL = ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+# Thread-safe lazy loaded client
+_bedrock_client = None
 
-# 30 second cooldown between calls to stay well within rate limits
-MAX_REQUESTS_PER_MINUTE = 2
-_MIN_INTERVAL = 30.0
-
-# Retry config
-MAX_RETRIES = 4           # total attempts = MAX_RETRIES + 1
-INITIAL_BACKOFF_S = 3.0   # first retry wait
-MAX_BACKOFF_S = 15.0      # cap on exponential backoff
-
-# ---------------------------------------------------------------------------
-# Singleton client + rate limiter
-# ---------------------------------------------------------------------------
-_client: Optional[genai.Client] = None
-_lock = threading.Lock()
-_last_call_time: float = 0.0
-_call_count: int = 0  # Global counter for total Gemini API calls
-
-
-def _get_client() -> genai.Client:
-    global _client
-    if _client is None:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if not api_key:
-            raise RuntimeError(
-                "GEMINI_API_KEY environment variable not set. "
-                "Get a free key at https://aistudio.google.com/apikey"
-            )
-        _client = genai.Client(api_key=api_key)
-    return _client
-
-
-def _rate_limit():
-    """Block until enough time has passed since the last call."""
-    global _last_call_time
-    with _lock:
-        now = time.monotonic()
-        elapsed = now - _last_call_time
-        if elapsed < _MIN_INTERVAL:
-            wait = _MIN_INTERVAL - elapsed
-            time.sleep(wait)
-        _last_call_time = time.monotonic()
-
-
-def _is_retryable(exc: Exception) -> bool:
-    """Check if an exception is a retryable Gemini API error (429/503)."""
-    err_str = str(exc)
-    return ("429" in err_str or "RESOURCE_EXHAUSTED" in err_str or
-            "503" in err_str or "UNAVAILABLE" in err_str or
-            "500" in err_str or "INTERNAL" in err_str)
-
-
-def _extract_retry_delay(exc: Exception) -> Optional[float]:
-    """Try to parse the retry delay from a Gemini 429 error message."""
-    err_str = str(exc)
-    match = re.search(r"retry in (\d+\.?\d*)s", err_str)
-    if match:
-        return float(match.group(1)) + 1.0  # add 1s margin
-    return None
-
+def _get_bedrock_client():
+    global _bedrock_client
+    if _bedrock_client is None:
+        # Boto3 automatically picks up AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
+        # and AWS_DEFAULT_REGION from the environment / .env file.
+        _bedrock_client = boto3.client(
+            service_name="bedrock-runtime",
+            region_name=AWS_REGION
+        )
+    return _bedrock_client
 
 def generate_content(
     contents: list,
-    config: Optional[types.GenerateContentConfig] = None,
-    model: str = GEMINI_MODEL,
+    config: Optional[Any] = None,
+    model: str = BEDROCK_MODEL_ID,
 ) -> str:
-    """Rate-limited, retry-enabled wrapper around Gemini generate_content.
-
-    Uses model rotation to spread calls across multiple models,
-    effectively multiplying the daily quota.
     """
-    client = _get_client()
-    last_exc = None
-    global _call_count
-    logger = logging.getLogger("gemini")
+    Routes visual-text reasoning content to Amazon Bedrock running Llama 3.2 Vision.
+    This accepts a list containing a text prompt and PIL Image objects.
+    """
+    client = _get_bedrock_client()
+    
+    text_prompt = ""
+    converse_content = []
 
-    # Pick model from rotation pool based on call count
-    actual_model = _MODEL_POOL[_call_count % len(_MODEL_POOL)]
-    logger.info(f"  [Gemini] Attempting call #{_call_count+1} with model={actual_model}")
+    # First extract text prompt
+    for item in contents:
+        if isinstance(item, str):
+            text_prompt += item + "\n"
+            
+    # Add text block to Bedrock Converse content
+    if text_prompt:
+        converse_content.append({
+            "text": text_prompt.strip()
+        })
 
-    for attempt in range(MAX_RETRIES + 1):
-        _rate_limit()
+    # Convert PIL Images to Bedrock Converse format
+    for item in contents:
+        if not isinstance(item, str) and hasattr(item, "save"):  # PIL Image
+            try:
+                # Resize image slightly to optimize payload size (800x800 for high quality)
+                img_copy = item.copy()
+                img_copy.thumbnail((800, 800))
+                
+                # Convert to RGB if the image has an alpha channel (RGBA), as JPEG doesn't support transparency
+                if img_copy.mode != "RGB":
+                    img_copy = img_copy.convert("RGB")
+                
+                buffered = io.BytesIO()
+                img_copy.save(buffered, format="JPEG")
+                img_bytes = buffered.getvalue()
+                
+                converse_content.append({
+                    "image": {
+                        "format": "jpeg",
+                        "source": {
+                            "bytes": img_bytes
+                        }
+                    }
+                })
+            except Exception as e:
+                logger.error(f"Failed to process PIL Image for Bedrock: {e}")
 
-        try:
-            response = client.models.generate_content(
-                model=actual_model,
-                contents=contents,
-                config=config,
-            )
-            _call_count += 1
-            logger.info(f"  [Gemini] ✅ Call #{_call_count} succeeded (model={actual_model})")
-            return response.text.strip()
+    logger.info(f"Sending request to Amazon Bedrock ({BEDROCK_MODEL_ID}) with {len(converse_content) - 1} images")
 
-        except Exception as e:
-            last_exc = e
-            err_str = str(e)
-
-            # If this model's quota is exhausted, try the next model in pool
-            if "RESOURCE_EXHAUSTED" in err_str or "429" in err_str:
-                old_model = actual_model
-                # Try next model in pool
-                pool_idx = _MODEL_POOL.index(actual_model) if actual_model in _MODEL_POOL else 0
-                next_idx = (pool_idx + 1) % len(_MODEL_POOL)
-                if _MODEL_POOL[next_idx] != old_model:
-                    actual_model = _MODEL_POOL[next_idx]
-                    logger.warning(f"  [Gemini] ⚠️  {old_model} quota exhausted, switching to {actual_model}")
-                    continue  # retry immediately with new model
-
-            if not _is_retryable(e) or attempt == MAX_RETRIES:
-                raise
-
-            # Calculate backoff
-            server_delay = _extract_retry_delay(e)
-            if server_delay:
-                backoff = min(server_delay, 15.0)
-            else:
-                backoff = min(
-                    INITIAL_BACKOFF_S * (2 ** attempt),
-                    MAX_BACKOFF_S,
-                )
-
-            logger.warning(f"  [Gemini] ⏳ Error (attempt {attempt+1}/{MAX_RETRIES+1}): "
-                  f"{type(e).__name__}. Retrying in {backoff:.1f}s...")
-            time.sleep(backoff)
-
-    raise RuntimeError(f"All {MAX_RETRIES+1} attempts failed. Last error: {last_exc}")
-
+    try:
+        response = client.converse(
+            modelId=BEDROCK_MODEL_ID,  # Force BEDROCK_MODEL_ID directly instead of overridden model parameter
+            messages=[
+                {
+                    "role": "user",
+                    "content": converse_content
+                }
+            ]
+        )
+        
+        message_content = response.get("output", {}).get("message", {}).get("content", [])
+        if message_content and "text" in message_content[0]:
+            output_text = message_content[0]["text"].strip()
+            
+            # Clean markdown wrappers if present (e.g. ```json ... ```)
+            if output_text.startswith("```"):
+                output_text = re.sub(r"^```(?:json)?\n", "", output_text)
+                output_text = re.sub(r"\n```$", "", output_text)
+            
+            return output_text.strip()
+        
+        return ""
+    except Exception as e:
+        logger.error(f"Amazon Bedrock Llama 3.2 Vision Converse call failed: {e}")
+        # Re-raise standard exception so the pipeline fails safe
+        raise

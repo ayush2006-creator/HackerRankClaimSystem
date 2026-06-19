@@ -26,9 +26,9 @@ def verify_object(image_path: str, claim_object: str) -> dict:
     model, processor = _load_clip()
     
     labels = [
-        "a photo of a car",
-        "a photo of a laptop computer",
-        "a photo of a shipping package or cardboard box"
+        "a photo of a car, car part, wheel, door, windshield, or bumper",
+        "a photo of a laptop computer, laptop screen, keyboard, hinge, or trackpad",
+        "a photo of a shipping package, cardboard box, mailer, package label, or seal"
     ]
     
     # Map label index to ObjectType string

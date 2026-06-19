@@ -121,7 +121,7 @@ def verify_instance(image_paths: List[str], detections_by_path: dict, claim_obje
                     
         if min_sim < config.DINO_SIMILARITY_THRESHOLD:
             # They don't look like the same object
-            risk_flags.add("wrong_object")
+            risk_flags.add("possible_manipulation")
 
     # 3. OCR Identity (Optional)
     identity_match = None

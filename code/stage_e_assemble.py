@@ -67,14 +67,16 @@ def assemble_decision(
         risk_flags.add(f)
         
     # Determine Valid Image (were ALL images usable?)
-    all_images_valid = True
+    # Determine Valid Image: true if at least one image is valid/usable
+    all_images_valid = False
     for img_id, v in stage_a_verdicts.items():
-        if not v.get("valid_image", True):
-            all_images_valid = False
+        if v.get("valid_image", True):
+            all_images_valid = True
             break
             
     # Determine Evidence Standard Met
-    instance_failed = stage_c_verdict and stage_c_verdict.get("min_similarity", 1.0) < 0.65 and not stage_c_verdict.get("identity_match")
+    # Softened: require similarity < 0.40 (very low) for hard rejection, and ensure no identity match
+    instance_failed = stage_c_verdict and stage_c_verdict.get("min_similarity", 1.0) < 0.40 and not stage_c_verdict.get("identity_match")
     
     evidence_standard_met = "true"
     evidence_reason = "Images meet minimum requirements for evaluation."
@@ -88,9 +90,10 @@ def assemble_decision(
     elif stage_d_reasoning.get("claim_status") == "not_enough_information":
         evidence_standard_met = "false"
         evidence_reason = stage_d_reasoning.get("justification", "Images lack required context.")
-    elif "wrong_object" in risk_flags:
-         evidence_standard_met = "false"
-         evidence_reason = "Images do not match the claimed object type."
+
+    # If final risk flags contain critical quality issues, the image set is not valid
+    if "non_original_image" in risk_flags or "cropped_or_obstructed" in risk_flags:
+        all_images_valid = False
 
     # Format risk flags for CSV
     final_risk_flags = "none"
