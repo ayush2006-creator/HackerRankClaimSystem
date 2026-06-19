@@ -17,4 +17,4 @@ safetensors>=0.4.0
 google-genai>=0.3.0
 
 # Blur / image quality check
-opencv-python-headless>=4.8.0
+opencv-python-headless>=4.8.0easyocr>=1.7.0

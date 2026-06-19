@@ -1,163 +1,106 @@
 """
 pipeline.py
-Orchestrates the full per-claim pipeline:
-
-  for each image:
-    1. image_quality.check_image_quality()      -- blur/corrupt check (local, free)
-    2. object_classifier.classify_image()        -- car/laptop/package/unknown (Gemini)
-    3. route to car_part_damage / laptop_damage / package_damage based on (2)
-
-  then, across all images for the claim:
-    4. transcript_matcher.match_claim_to_evidence() -- final decision (Gemini)
-    5. apply risk flags + evidence_standard_met logic
-    6. build ClaimDecision
+Orchestrates the full per-claim pipeline across 5 stages.
 """
 
 import os
-from typing import List
+from typing import List, Dict
+import logging
 
-from schema import (
-    ClaimPacket, ClaimDecision, ImageFindings, ObjectType,
-    ClaimStatus, Severity, RISK_FLAGS,
-)
+from schema import ClaimPacket, ClaimDecision, ObjectType
 from image_quality import check_image_quality
-from object_classifier import classify_image
-from car_part_damage import detect_car_parts_and_damage
-from laptop_damage import detect_laptop_damage
-from package_damage import detect_package_damage
-from transcript_matcher import match_claim_to_evidence
+from stage_a_object_verify import verify_all_images
+from stage_b_detect import detect, Detection
+import stage_c_instance_verify
+from stage_d_gemini_reason import reason_claim
+from stage_e_assemble import assemble_decision
 
-
-# Minimum number of usable images we'd like to see before treating
-# evidence as fully "standard met" -- below this we still proceed,
-# but flag damage_not_visible as a risk flag.
-MIN_USABLE_IMAGES_FOR_FULL_EVIDENCE = 2
-
-
-def _analyze_single_image(image_path: str, image_id: str) -> ImageFindings:
-    quality = check_image_quality(image_path)
-
-    if not quality.valid_image:
-        return ImageFindings(
-            image_id=image_id,
-            image_path=image_path,
-            object_type=ObjectType.UNKNOWN.value,
-            object_confidence=0.0,
-            quality=quality,
-            findings=[],
-            raw_notes="Skipped damage detection -- image failed quality check.",
-        )
-
-    obj_result = classify_image(image_path, image_id)
-
-    findings = []
-    if obj_result.object_type == ObjectType.CAR.value:
-        findings = detect_car_parts_and_damage(image_path)
-    elif obj_result.object_type == ObjectType.LAPTOP.value:
-        findings = detect_laptop_damage(image_path)
-    elif obj_result.object_type == ObjectType.PACKAGE.value:
-        findings = detect_package_damage(image_path)
-    # else: unknown object type -> no detector to run, findings stays empty
-
-    return ImageFindings(
-        image_id=image_id,
-        image_path=image_path,
-        object_type=obj_result.object_type,
-        object_confidence=obj_result.confidence,
-        quality=quality,
-        findings=findings,
-        raw_notes=obj_result.reasoning,
-    )
-
-
-def _compute_risk_flags(
-    claim: ClaimPacket,
-    image_findings: List[ImageFindings],
-) -> List[str]:
-    flags = []
-
-    usable = [imf for imf in image_findings if imf.quality.valid_image]
-
-    if len(usable) < len(image_findings):
-        flags.append("blurry_image")
-
-    if len(usable) < MIN_USABLE_IMAGES_FOR_FULL_EVIDENCE:
-        flags.append("damage_not_visible")
-
-    # wrong_object: claim_object says one thing, majority of usable
-    # images detect a different object type
-    if usable:
-        mismatched = [
-            imf for imf in usable
-            if imf.object_type not in (claim.claim_object, ObjectType.UNKNOWN.value)
-        ]
-        if mismatched and len(mismatched) >= len(usable):
-            flags.append("wrong_object")
-
-    # possible_manipulation: cheap check via file size as a weak proxy
-    # (a real implementation would hash pixel content)
-    sizes = {}
-    for imf in image_findings:
-        try:
-            sz = os.path.getsize(imf.image_path)
-            sizes[sz] = sizes.get(sz, 0) + 1
-        except OSError:
-            continue
-    if any(count > 1 for count in sizes.values()):
-        flags.append("possible_manipulation")
-
-    # user_history_risk: from user_history.csv lookup, passed in via claim.user_history
-    prior_claims = claim.user_history.get("past_claim_count")
-    try:
-        if prior_claims is not None and int(prior_claims) > 2:
-            flags.append("user_history_risk")
-    except (ValueError, TypeError):
-        pass
-
-    return flags
-
+logger = logging.getLogger("pipeline")
 
 def run_pipeline(claim: ClaimPacket) -> ClaimDecision:
-    """Runs the full pipeline for a single claim and returns the decision."""
+    """Runs the full 5-stage pipeline for a single claim."""
+    
+    logger.info(f"{'='*60}")
+    logger.info(f"CLAIM {claim.claim_id} | object={claim.claim_object} | images={len(claim.image_paths)}")
+    logger.info(f"{'='*60}")
+    
+    # --- STAGE A: Object Verification & Basic Quality ---
+    logger.info(f"[Stage A] Running CLIP object verification (LOCAL, no API call)")
+    stage_a_verdicts = verify_all_images(claim.image_paths, claim.claim_object)
+    
+    # Inject basic quality checks into Stage A verdicts
+    for img_id, path in zip([os.path.splitext(os.path.basename(p))[0] for p in claim.image_paths], claim.image_paths):
+        quality = check_image_quality(path)
+        if img_id in stage_a_verdicts:
+            stage_a_verdicts[img_id]["valid_image"] = quality.valid_image
+            if not quality.valid_image:
+                 stage_a_verdicts[img_id]["risk_flags"].append("blurry_image")
 
-    # ---- Step 1-3: per-image analysis ----
-    image_findings: List[ImageFindings] = []
-    for idx, path in enumerate(claim.image_paths):
-        image_id = os.path.splitext(os.path.basename(path))[0]
-        image_findings.append(_analyze_single_image(path, image_id))
+    for img_id, v in stage_a_verdicts.items():
+        logger.info(f"  [Stage A] {img_id}: match={v.get('match')}, valid={v.get('valid_image', True)}, flags={v.get('risk_flags')}")
 
-    # ---- Step 4: transcript vs. evidence matching ----
-    match = match_claim_to_evidence(claim.user_claim, image_findings)
+    # Filter paths for Stage B/C: only those that matched object AND passed quality
+    usable_paths = []
+    for path in claim.image_paths:
+        img_id = os.path.splitext(os.path.basename(path))[0]
+        v = stage_a_verdicts.get(img_id, {})
+        if v.get("match", False) and v.get("valid_image", True):
+            usable_paths.append(path)
 
-    # ---- Step 5: risk flags + evidence_standard_met ----
-    risk_flags = _compute_risk_flags(claim, image_findings)
-    if match.claim_status == ClaimStatus.NOT_ENOUGH_INFORMATION.value and "damage_not_visible" not in risk_flags:
-        # only add this flag if it wasn't already an obvious quality/mismatch issue
-        if "blurry_image" not in risk_flags and "wrong_object" not in risk_flags:
-            risk_flags.append("damage_not_visible")
+    logger.info(f"[Stage A] {len(usable_paths)}/{len(claim.image_paths)} images passed object+quality filter")
 
-    usable_count = sum(1 for imf in image_findings if imf.quality.valid_image)
-    evidence_standard_met = usable_count >= 1 and match.claim_status != ClaimStatus.NOT_ENOUGH_INFORMATION.value
+    # --- STAGE B: Damage Detection ---
+    logger.info(f"[Stage B] Running damage detection for {claim.claim_object}")
+    stage_b_detections: Dict[str, List[Detection]] = {}
+    for path in usable_paths:
+        img_id = os.path.splitext(os.path.basename(path))[0]
+        stage_b_detections[img_id] = detect(path, claim.claim_object)
+        logger.info(f"  [Stage B] {img_id}: {len(stage_b_detections[img_id])} detections found")
+        for d in stage_b_detections[img_id]:
+            logger.info(f"    -> part={d.object_part}, issue={d.issue_type}, conf={d.confidence:.2f}, src={d.class_name}")
 
-    if evidence_standard_met:
-        evidence_reason = f"{usable_count} usable image(s) provided clear evidence to evaluate the claim."
-    elif usable_count == 0:
-        evidence_reason = "No usable images were available to evaluate the claim."
+    # --- STAGE C: Instance Verification ---
+    stage_c_verdict = None
+    if len(usable_paths) > 1:
+        logger.info(f"[Stage C] Running DINOv2 instance verification (LOCAL, no API call)")
+        dets_by_path = {}
+        for path in usable_paths:
+            img_id = os.path.splitext(os.path.basename(path))[0]
+            dets_by_path[path] = stage_b_detections.get(img_id, [])
+            
+        cv_result = stage_c_instance_verify.verify_instance(
+            usable_paths, dets_by_path, claim.claim_object
+        )
+        stage_c_verdict = {
+            "min_similarity": cv_result.min_similarity,
+            "identity_match": cv_result.identity_match,
+            "exif_flag": cv_result.exif_flag,
+            "risk_flags": cv_result.risk_flags
+        }
+        logger.info(f"  [Stage C] similarity={cv_result.min_similarity:.2f}, identity_match={cv_result.identity_match}, flags={cv_result.risk_flags}")
     else:
-        evidence_reason = "Available images were insufficient to confidently evaluate the claim against the transcript."
+        logger.info(f"[Stage C] Skipped (single image claim)")
 
-    all_valid = all(imf.quality.valid_image for imf in image_findings) if image_findings else False
-
-    # ---- Step 6: assemble ClaimDecision ----
-    return ClaimDecision(
-        evidence_standard_met="true" if evidence_standard_met else "false",
-        evidence_standard_met_reason=evidence_reason,
-        risk_flags=";".join(risk_flags) if risk_flags else "none",
-        issue_type=match.issue_type,
-        object_part=match.object_part,
-        claim_status=match.claim_status,
-        claim_status_justification=match.justification,
-        supporting_image_ids=";".join(match.supporting_image_ids) if match.supporting_image_ids else "none",
-        valid_image="true" if all_valid else "false",
-        severity=match.severity,
+    # --- STAGE D: Gemini Reasoning Layer ---
+    logger.info(f"[Stage D] *** GEMINI API CALL *** (1 call for this claim)")
+    stage_d_reasoning = reason_claim(
+        claim=claim,
+        stage_a_verdicts=stage_a_verdicts,
+        stage_b_detections=stage_b_detections,
+        stage_c_verdict=stage_c_verdict
     )
+    logger.info(f"  [Stage D] Result: status={stage_d_reasoning.get('claim_status')}, issue={stage_d_reasoning.get('issue_type')}, severity={stage_d_reasoning.get('severity')}")
+
+    # --- STAGE E: Assembly ---
+    logger.info(f"[Stage E] Assembling final decision (LOCAL, no API call)")
+    decision = assemble_decision(
+        claim=claim,
+        stage_a_verdicts=stage_a_verdicts,
+        stage_b_detections=list(stage_b_detections.values()),
+        stage_c_verdict=stage_c_verdict,
+        stage_d_reasoning=stage_d_reasoning
+    )
+    logger.info(f"  [Stage E] Final: status={decision.claim_status}, issue={decision.issue_type}, severity={decision.severity}")
+    logger.info(f"{'='*60}\n")
+
+    return decision
