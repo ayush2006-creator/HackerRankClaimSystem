@@ -1,0 +1,94 @@
+**pycache**/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual Environments
+
+venv/
+.venv/
+env/
+ENV/
+
+# Environment Variables & Secrets
+
+.env
+.env.*
+*.pem
+*.key
+secrets.json
+credentials.json
+
+# IDE
+
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Jupyter
+
+.ipynb_checkpoints/
+
+# Build
+
+build/
+dist/
+*.egg-info/
+
+# Logs
+
+logs/
+*.log
+
+# AI / ML Models
+
+models/
+checkpoints/
+weights/
+*.ckpt
+*.pt
+*.pth
+*.bin
+*.safetensors
+
+# Hugging Face
+
+.cache/
+huggingface/
+.huggingface/
+
+# Data
+
+data/raw/
+data/processed/
+datasets/
+uploads/
+
+# Temporary Files
+
+tmp/
+temp/
+*.tmp
+
+# MacOS
+
+.DS_Store
+
+# Testing Output
+
+results/
+outputs/
+predictions/
+
+# Local Config
+
+config.local.yaml
+config.local.yml
+config.local.json
+
