@@ -15,7 +15,7 @@ from schema import ImageQuality
 # Tunable thresholds -- variance of Laplacian below this = blurry.
 # 100 is a common starting point for "reasonably sharp photo" in
 # the OpenCV blur-detection literature; tune against your sample set.
-BLUR_VARIANCE_THRESHOLD = 45.0
+BLUR_VARIANCE_THRESHOLD = 35.0
 MIN_DIMENSION_PX = 200  # reject tiny/thumbnail images outright
 
 

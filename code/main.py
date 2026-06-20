@@ -36,7 +36,7 @@ CLAIMS_CSV       = DATASET_DIR / "claims.csv"
 USER_HISTORY_CSV = DATASET_DIR / "user_history.csv"
 EVIDENCE_REQ_CSV = DATASET_DIR / "evidence_requirements.csv"
 
-OUTPUT_CSV = Path(__file__).parent.parent / "output.csv"
+OUTPUT_CSV = DATASET_DIR / "output.csv"
 
 # --- claims.csv columns ---
 # "user_id","image_paths","user_claim","claim_object"
@@ -179,7 +179,7 @@ def main():
     parser.add_argument("--claims-csv", type=Path, default=CLAIMS_CSV,
                         help="Path to claims CSV (default: dataset/claims.csv)")
     parser.add_argument("--output", type=Path, default=OUTPUT_CSV,
-                        help="Path to write output.csv (default: ./output.csv)")
+                        help="Path to write output.csv (default: dataset/output.csv)")
     parser.add_argument("--limit", type=int, default=None,
                         help="Only process first N rows (for quick testing)")
     args = parser.parse_args()

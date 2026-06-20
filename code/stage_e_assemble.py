@@ -78,6 +78,42 @@ def assemble_decision(
     # Softened: require similarity < 0.40 (very low) for hard rejection, and ensure no identity match
     instance_failed = stage_c_verdict and stage_c_verdict.get("min_similarity", 1.0) < 0.40 and not stage_c_verdict.get("identity_match")
     
+    # Extract structural features from Stage D
+    issue_type = stage_d_reasoning.get("issue_type", "unknown")
+    object_part = stage_d_reasoning.get("object_part", "unknown")
+    severity = stage_d_reasoning.get("severity", "unknown")
+    
+    # Determine Claim Status deterministically from features
+    is_contradicted = False
+    if (
+        "wrong_object" in risk_flags or
+        "claim_mismatch" in risk_flags or
+        "wrong_object_part" in risk_flags or
+        issue_type == "none" or
+        severity == "none" or
+        instance_failed
+    ):
+        is_contradicted = True
+
+    is_not_enough_info = False
+    if not is_contradicted:
+        if (
+            ("wrong_angle" in risk_flags and "damage_not_visible" in risk_flags) or
+            ("cropped_or_obstructed" in risk_flags and "damage_not_visible" in risk_flags) or
+            issue_type == "unknown" or
+            severity == "unknown" or
+            object_part == "unknown" or
+            valid_image_count == 0
+        ):
+            is_not_enough_info = True
+
+    if is_contradicted:
+        claim_status = "contradicted"
+    elif is_not_enough_info:
+        claim_status = "not_enough_information"
+    else:
+        claim_status = "supported"
+
     evidence_standard_met = "true"
     evidence_reason = "Images meet minimum requirements for evaluation."
     
@@ -87,7 +123,7 @@ def assemble_decision(
     elif instance_failed:
         evidence_standard_met = "false"
         evidence_reason = "Images appear to show different object instances; cross-image verification failed."
-    elif stage_d_reasoning.get("claim_status") == "not_enough_information":
+    elif claim_status == "not_enough_information":
         evidence_standard_met = "false"
         evidence_reason = stage_d_reasoning.get("justification", "Images lack required context.")
 
@@ -106,11 +142,11 @@ def assemble_decision(
         evidence_standard_met=evidence_standard_met,
         evidence_standard_met_reason=evidence_reason,
         risk_flags=final_risk_flags,
-        issue_type=stage_d_reasoning.get("issue_type", "unknown"),
-        object_part=stage_d_reasoning.get("object_part", "unknown"),
-        claim_status=stage_d_reasoning.get("claim_status", "not_enough_information"),
+        issue_type=issue_type,
+        object_part=object_part,
+        claim_status=claim_status,
         claim_status_justification=stage_d_reasoning.get("justification", "Insufficient data to assemble decision."),
         supporting_image_ids=";".join(stage_d_reasoning.get("supporting_image_ids", [])) or "none",
         valid_image="true" if all_images_valid else "false",
-        severity=stage_d_reasoning.get("severity", "unknown")
+        severity=severity
     )

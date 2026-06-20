@@ -9,8 +9,6 @@ import config
 from class_mappings import normalize_part, normalize_issue
 from schema import ObjectType
 from car_part_damage import detect_car_parts_and_damage
-from laptop_damage import detect_laptop_damage
-from package_damage import detect_package_damage
 
 @dataclass
 class Detection:

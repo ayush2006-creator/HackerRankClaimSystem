@@ -72,11 +72,28 @@ def evaluate():
         for k, v in metrics.items():
             f.write(f"- **{k}**: {v}/{total} ({v/total*100:.1f}%)\n")
             
+        f.write("\n## Detailed Mismatch Breakdown\n")
+        f.write("| Claim ID | Field | Expected (GT) | Predicted | Justification |\n")
+        f.write("|---|---|---|---|---|\n")
+        
+        for i, row in df.iterrows():
+            pred = pred_df[pred_df['claim_id'] == str(i+1)].iloc[0]
+            claim_mismatches = []
+            for k in ["evidence_standard_met", "claim_status", "issue_type", "object_part", "valid_image", "severity"]:
+                val_gt = str(row.get(k, "")).lower().strip()
+                val_pred = str(pred.get(k, "")).lower().strip()
+                if val_gt != val_pred:
+                    claim_mismatches.append((k, val_gt, val_pred))
+            
+            for field, gt, pr in claim_mismatches:
+                just = str(pred.get("claim_status_justification", "")).replace("\n", " ")
+                f.write(f"| {i+1} | {field} | {gt} | {pr} | {just} |\n")
+            
         f.write("\n## Operational Analysis\n")
         f.write("- **Stage A (Object Verification)**: Local CLIP inference. Cost: Free. Call count: 1 per image.\n")
         f.write("- **Stage B (Damage Detection)**: Roboflow API / Local fallback. Call count: 1 per valid image.\n")
         f.write("- **Stage C (Instance Verification)**: Local DINOv2 inference. Cost: Free. Call count: 1 per valid image if >1 image.\n")
-        f.write("- **Stage D (Reasoning)**: Gemini Flash Lite. Call count: Exactly 1 per claim. All images and signals sent in one batch.\n")
+        f.write("- **Stage D (Reasoning)**: Amazon Bedrock (Nova Pro). Call count: Exactly 1 per claim. All images and signals sent in one batch.\n")
         f.write("\nThis architecture significantly reduces API calls compared to the naive approach by moving object verification and instance matching to local, free models, and restricting the LLM to a single reasoning step per claim.\n")
         
     print(f"\nDetailed report written to {report_path}")

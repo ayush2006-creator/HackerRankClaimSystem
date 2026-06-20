@@ -31,6 +31,7 @@ def run_pipeline(claim: ClaimPacket) -> ClaimDecision:
     # Inject basic quality checks into Stage A verdicts
     for img_id, path in zip([os.path.splitext(os.path.basename(p))[0] for p in claim.image_paths], claim.image_paths):
         quality = check_image_quality(path)
+        logger.info(f"  [DEBUG] path={path} score={quality.blur_score} valid={quality.valid_image} reason={quality.reason}")
         if img_id in stage_a_verdicts:
             stage_a_verdicts[img_id]["valid_image"] = quality.valid_image
             if not quality.valid_image:

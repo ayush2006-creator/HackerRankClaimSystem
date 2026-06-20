@@ -127,38 +127,98 @@ def detect_car_parts_and_damage(
     Runs the full two-stage pipeline on one car image and returns a
     list of (part, damage_type) findings.
     """
-    findings: List[PartDamageFinding] = []
+    import config
+    from class_mappings import CURACEL_CLASS_MAP, normalize_part, normalize_issue
+
+    direct_findings: List[PartDamageFinding] = []
+    part_boxes = []
 
     full_image = Image.open(image_path).convert("RGB")
 
-    # ---- Stage 1: part localization via Roboflow ----
-    part_boxes = []
+    # ---- Stage 1: part localization via Roboflow (YOLO or Workflow) ----
+    model_id = config.ROBOFLOW_CAR_MODEL or ROBOFLOW_MODEL_ID
+    use_workflow = "general-segmentation-api" in model_id
+
     try:
-        client = _get_roboflow_client()
-        result = client.infer(image_path, model_id=ROBOFLOW_MODEL_ID)
-        predictions = result.get("predictions", []) if isinstance(result, dict) else []
+        if use_workflow:
+            from inference_sdk import InferenceHTTPClient
+            api_key = os.environ.get("ROBOFLOW_API_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "ROBOFLOW_API_KEY environment variable not set. "
+                    "Get a free key at https://app.roboflow.com/settings/api"
+                )
+            wf_client = InferenceHTTPClient(
+                api_url="https://serverless.roboflow.com",
+                api_key=api_key,
+            )
+            classes_param = "bonnet-dent, doorouter-dent, doorouter-paint-trace, doorouter-scratch, fender-dent, front-bumper-dent, major-rear-bumper-dent, quarter-panel-dent, pillar-dent, body-panel-dent, front-bumper-scratch, paint-chip, paint-trace, front-windscreen damage, rear-windscreen damage, headlight damage, taillight damage, side-mirror damage, bonnet, bumper, door, fender, headlight, taillight, side-mirror, windshield, scratch, dent, crack"
+            
+            result = wf_client.run_workflow(
+                workspace_name="ayushs-workspace-zfnzn",
+                workflow_id=model_id,
+                images={"image": image_path},
+                parameters={"classes": classes_param},
+                use_cache=True
+            )
+            if isinstance(result, list) and len(result) > 0:
+                predictions = result[0].get('predictions', {}).get('predictions', [])
+            elif isinstance(result, dict):
+                predictions = result.get('predictions', {}).get('predictions', [])
+            else:
+                predictions = []
+        else:
+            client = _get_roboflow_client()
+            result = client.infer(image_path, model_id=model_id)
+            predictions = result.get("predictions", []) if isinstance(result, dict) else []
 
         for pred in predictions:
-            raw_label = pred.get("class", "")
-            part_name = ROBOFLOW_LABEL_MAP.get(raw_label, "unknown")
+            raw_label = pred.get("class", "").strip()
+            raw_label_lower = raw_label.lower()
+            
             cx, cy = pred.get("x", 0), pred.get("y", 0)
             w, h = pred.get("width", 0), pred.get("height", 0)
             x1, y1 = max(0, cx - w / 2), max(0, cy - h / 2)
             x2, y2 = cx + w / 2, cy + h / 2
-            part_boxes.append({
-                "part": part_name,
-                "bbox": (x1, y1, x2, y2),
-                "part_confidence": pred.get("confidence", 0.0),
-            })
+            bbox = (x1, y1, x2, y2)
+            conf = pred.get("confidence", 0.0)
+
+            # Map part and damage type
+            part_name = normalize_part(raw_label, "car")
+            damage_type = normalize_issue(raw_label, "car")
+
+            # Check if this raw label is in CURACEL_CLASS_MAP and is combined
+            is_combined = False
+            if raw_label_lower in CURACEL_CLASS_MAP:
+                mapped_damage = CURACEL_CLASS_MAP[raw_label_lower][1]
+                if mapped_damage != "unknown":
+                    is_combined = True
+                    damage_type = mapped_damage
+
+            if is_combined:
+                direct_findings.append(PartDamageFinding(
+                    part=part_name,
+                    damage_type=damage_type,
+                    confidence=round(conf, 3),
+                    severity=_severity_from_confidence(conf),
+                    bbox=bbox,
+                ))
+            else:
+                if part_name != "unknown":
+                    part_boxes.append({
+                        "part": part_name,
+                        "bbox": bbox,
+                        "part_confidence": conf,
+                    })
     except Exception as e:
-        # Roboflow call failed (no key, network, etc). Fall back to
-        # whole-image damage classification with part="unknown" below.
         part_boxes = []
         _stage1_error = str(e)
     else:
         _stage1_error = None
 
     # ---- Stage 2: damage classification per part crop ----
+    findings = list(direct_findings)
+
     if part_boxes:
         for pb in part_boxes:
             x1, y1, x2, y2 = pb["bbox"]
@@ -181,19 +241,19 @@ def detect_car_parts_and_damage(
                 bbox=pb["bbox"],
             ))
     else:
-        # Fallback: no part boxes (Roboflow failed or found nothing).
-        # Classify the whole image once so we don't lose the signal entirely.
-        try:
-            damage_type, conf = _classify_damage_crop(full_image)
-            if conf >= damage_confidence_threshold:
-                findings.append(PartDamageFinding(
-                    part="unknown",
-                    damage_type=damage_type,
-                    confidence=round(conf, 3),
-                    severity=_severity_from_confidence(conf),
-                    bbox=None,
-                ))
-        except Exception:
-            pass
+        # Fallback: only if we got no direct findings AND no part boxes
+        if not findings:
+            try:
+                damage_type, conf = _classify_damage_crop(full_image)
+                if conf >= damage_confidence_threshold:
+                    findings.append(PartDamageFinding(
+                        part="unknown",
+                        damage_type=damage_type,
+                        confidence=round(conf, 3),
+                        severity=_severity_from_confidence(conf),
+                        bbox=None,
+                    ))
+            except Exception:
+                pass
 
     return findings
