@@ -63,7 +63,7 @@ def generate_content(
             try:
                 # Resize image slightly to optimize payload size (800x800 for high quality)
                 img_copy = item.copy()
-                img_copy.thumbnail((800, 800))
+                img_copy.thumbnail((1024, 1024))
                 
                 # Convert to RGB if the image has an alpha channel (RGBA), as JPEG doesn't support transparency
                 if img_copy.mode != "RGB":

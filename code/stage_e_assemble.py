@@ -83,29 +83,44 @@ def assemble_decision(
     object_part = stage_d_reasoning.get("object_part", "unknown")
     severity = stage_d_reasoning.get("severity", "unknown")
     
-    # Determine Claim Status deterministically from features
+    # Extract the VLM's claim_status judgment
+    vlm_claim_status = stage_d_reasoning.get("claim_status", "unknown")
+    
+    # Determine Claim Status deterministically from features,
+    # but give the VLM's judgment more weight when no hard signals fire.
     is_contradicted = False
-    if (
+    
+    # Hard contradiction signals — these override VLM
+    hard_contradiction = (
         "wrong_object" in risk_flags or
         "claim_mismatch" in risk_flags or
         "wrong_object_part" in risk_flags or
-        issue_type == "none" or
-        severity == "none" or
         instance_failed
-    ):
+    )
+    
+    if hard_contradiction:
+        is_contradicted = True
+    elif issue_type == "none" or severity == "none":
+        # No damage detected = contradicted
+        is_contradicted = True
+    elif vlm_claim_status == "contradicted":
+        # Trust VLM's contradiction judgment even without hard signals
         is_contradicted = True
 
     is_not_enough_info = False
     if not is_contradicted:
-        if (
+        if vlm_claim_status == "not_enough_information":
+            # Trust the VLM's NEI judgment when no hard contradictions fired
+            is_not_enough_info = True
+        elif (
             ("wrong_angle" in risk_flags and "damage_not_visible" in risk_flags) or
             ("cropped_or_obstructed" in risk_flags and "damage_not_visible" in risk_flags) or
-            issue_type == "unknown" or
-            severity == "unknown" or
-            object_part == "unknown" or
             valid_image_count == 0
         ):
             is_not_enough_info = True
+        # Note: removed issue_type=="unknown" / severity=="unknown" / object_part=="unknown"
+        # as standalone NEI triggers — these now only trigger NEI via the VLM's own judgment.
+        # This prevents unknown values from flipping a VLM "contradicted" to NEI.
 
     if is_contradicted:
         claim_status = "contradicted"
